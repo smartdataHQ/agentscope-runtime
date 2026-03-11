@@ -39,7 +39,9 @@ my-agent-project/
 ```python
 # -*- coding: utf-8 -*-
 import os
+from contextlib import asynccontextmanager
 
+from fastapi import FastAPI
 from agentscope.agent import ReActAgent
 from agentscope.formatter import DashScopeChatFormatter
 from agentscope.model import DashScopeChatModel
@@ -51,24 +53,31 @@ from agentscope.session import RedisSession
 from agentscope_runtime.engine.app import AgentApp
 from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
 
-# Create AgentApp instance
-agent_app = AgentApp(
-    app_name="MyAssistant",
-    app_description="A helpful assistant agent",
-)
-
-
-@agent_app.init
-async def init_func(self):
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """初始化服务。"""
     import fakeredis
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    fake_redis = fakeredis.aioredis.FakeRedis(
+        decode_responses=True
+    )
     # 注意：这个 FakeRedis 实例仅用于开发/测试。
     # 在生产环境中，请替换为你自己的 Redis 客户端/连接
     #（例如 aioredis.Redis）。
-    self.session = RedisSession(connection_pool=fake_redis.connection_pool)
+    app.state.session = RedisSession(
+        connection_pool=fake_redis.connection_pool
+    )
+    try:
+        yield
+    finally:
+        print("AgentApp is shutting down...")
 
+# 创建 AgentApp
+agent_app = AgentApp(
+    app_name="MyAssistant",
+    app_description="A helpful assistant agent",
+    lifespan=lifespan,
+)
 
 @agent_app.query(framework="agentscope")
 async def query_func(
@@ -77,7 +86,7 @@ async def query_func(
     request: AgentRequest = None,
     **kwargs,
 ):
-    """Process user queries."""
+    """处理用户查询。"""
     session_id = request.session_id
     user_id = request.user_id
 
@@ -101,7 +110,7 @@ async def query_func(
     )
     agent.set_console_output_enabled(False)
 
-    await self.session.load_session_state(
+    await agent_app.state.session.load_session_state(
         session_id=session_id,
         user_id=user_id,
         agent=agent,
@@ -113,7 +122,7 @@ async def query_func(
     ):
         yield msg, last
 
-    await self.session.save_session_state(
+    await agent_app.state.session.save_session_state(
         session_id=session_id,
         user_id=user_id,
         agent=agent,
@@ -392,6 +401,7 @@ agentscope deploy PLATFORM SOURCE [OPTIONS]
 - `agentrun`：阿里云 AgentRun
 - `k8s`：Kubernetes/ACK
 - `knative`：Knative/ACK Knative
+- `kruise`：Kruise Sandbox
 
 #### 通用选项（所有平台）
 
@@ -627,6 +637,73 @@ agentscope deploy knative app_agent.py \
 
 # 自定义命名空间和资源
 agentscope deploy knative app_agent.py \
+  --namespace production \
+  --cpu-limit 2 \
+  --memory-limit 4Gi \
+  --env DASHSCOPE_API_KEY=sk-xxx
+```
+
+**注意：** `USE_LOCAL_RUNTIME=True` 使用本地 agentscope runtime 而不是 PyPI 版本。
+
+#### 4.5. Kruise 部署
+
+部署到 Kubernetes 集群的 Kruise Sandbox 自定义资源（`agents.kruise.io/v1alpha1`）。
+
+Kruise Sandbox 与标准 K8s Deployment 和 Knative 的区别：
+- **实例级隔离**：确保不同 agent 运行环境安全隔离
+- **暂停恢复**：支持暂停和恢复，有效节省资源消耗
+- **自动创建 LoadBalancer Service**：为外部访问自动创建负载均衡服务
+
+##### 命令语法
+
+```bash
+agentscope deploy kruise SOURCE [OPTIONS]
+```
+
+##### 平台特定选项
+
+| 选项 | 类型 | 默认值 | 描述 |
+|------|------|--------|------|
+| `--namespace` | string | `"agentscope-runtime"` | Kubernetes 命名空间 |
+| `--kube-config-path` | path | `None` | kubeconfig 文件路径 |
+| `--port` | integer | `8080` | 容器端口 |
+| `--image-name` | string | `"agent_app"` | Docker 镜像名称 |
+| `--image-tag` | string | `"linux-amd64"` | Docker 镜像标签 |
+| `--registry-url` | string | `"localhost"` | 远程注册表 URL |
+| `--registry-namespace` | string | `"agentscope-runtime"` | 远程注册表命名空间 |
+| `--push` | flag | `False` | 推送镜像到注册表 |
+| `--base-image` | string | `"python:3.10-slim-bookworm"` | 基础 Docker 镜像 |
+| `--requirements` | string | `None` | Python 依赖（逗号分隔或文件路径） |
+| `--cpu-request` | string | `"200m"` | CPU 资源请求（例如 '200m'、'1'） |
+| `--cpu-limit` | string | `"1000m"` | CPU 资源限制（例如 '1000m'、'2'） |
+| `--memory-request` | string | `"512Mi"` | 内存资源请求（例如 '512Mi'、'1Gi'） |
+| `--memory-limit` | string | `"2Gi"` | 内存资源限制（例如 '2Gi'、'4Gi'） |
+| `--image-pull-policy` | choice | `"IfNotPresent"` | 镜像拉取策略：`Always`、`IfNotPresent`、`Never` |
+| `--deploy-timeout` | integer | `300` | 部署超时时间（秒） |
+| `--platform` | string | `"linux/amd64"` | 目标平台（例如 'linux/amd64'、'linux/arm64'） |
+| `--pypi-mirror` | string | `None` | PyPI 镜像源 URL，用于 pip 包安装（例如 'https://pypi.tuna.tsinghua.edu.cn/simple'）。如果未指定，使用 pip 默认源 |
+
+##### 前置要求
+
+- Kubernetes 集群访问权限
+- 已安装 Kruise Sandbox CRD（`agents.kruise.io/v1alpha1`），参考 [Kruise Agents](https://github.com/openkruise/agents)
+- 已安装 Docker（用于构建镜像）
+- 已配置 `kubectl`
+
+##### 示例
+
+```bash
+# 基本部署
+export USE_LOCAL_RUNTIME=True
+agentscope deploy kruise app_agent.py \
+  --image-name agent_app \
+  --env DASHSCOPE_API_KEY=sk-xxx \
+  --image-tag linux-amd64-1 \
+  --registry-url your-registry.com \
+  --push
+
+# 自定义命名空间和资源
+agentscope deploy kruise app_agent.py \
   --namespace production \
   --cpu-limit 2 \
   --memory-limit 4Gi \

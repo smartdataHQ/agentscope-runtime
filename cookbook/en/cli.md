@@ -39,7 +39,9 @@ Create `app_agent.py`:
 ```python
 # -*- coding: utf-8 -*-
 import os
+from contextlib import asynccontextmanager
 
+from fastapi import FastAPI
 from agentscope.agent import ReActAgent
 from agentscope.formatter import DashScopeChatFormatter
 from agentscope.model import DashScopeChatModel
@@ -51,24 +53,32 @@ from agentscope.session import RedisSession
 from agentscope_runtime.engine.app import AgentApp
 from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize service."""
+    import fakeredis
+
+    fake_redis = fakeredis.aioredis.FakeRedis(
+        decode_responses=True
+    )
+    # NOTE: This FakeRedis instance is for development/testing only.
+    # In production, replace it with your own Redis client/connection
+    # (e.g., aioredis.Redis)
+    app.state.session = RedisSession(
+        connection_pool=fake_redis.connection_pool
+    )
+    try:
+        yield
+    finally:
+        print("AgentApp is shutting down...")
+
+
 # Create AgentApp instance
 agent_app = AgentApp(
     app_name="MyAssistant",
     app_description="A helpful assistant agent",
+    lifespan=lifespan,
 )
-
-
-@agent_app.init
-async def init_func(self):
-    """Initialize services."""
-    import fakeredis
-
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    # 注意：这个 FakeRedis 实例仅用于开发/测试。
-    # 在生产环境中，请替换为你自己的 Redis 客户端/连接
-    #（例如 aioredis.Redis）。
-    self.session = RedisSession(connection_pool=fake_redis.connection_pool)
-
 
 @agent_app.query(framework="agentscope")
 async def query_func(
@@ -101,7 +111,7 @@ async def query_func(
     )
     agent.set_console_output_enabled(False)
 
-    await self.session.load_session_state(
+    await agent_app.state.session.load_session_state(
         session_id=session_id,
         user_id=user_id,
         agent=agent,
@@ -113,7 +123,7 @@ async def query_func(
     ):
         yield msg, last
 
-    await self.session.save_session_state(
+    await agent_app.state.session.save_session_state(
         session_id=session_id,
         user_id=user_id,
         agent=agent,
@@ -392,6 +402,8 @@ agentscope deploy PLATFORM SOURCE [OPTIONS]
 - `modelstudio`: Alibaba Cloud ModelStudio
 - `agentrun`: Alibaba Cloud AgentRun
 - `k8s`: Kubernetes/ACK
+- `knative`: Knative/ACK Knative
+- `kruise`: Kruise Sandbox
 
 #### Common Options (All Platforms)
 
@@ -627,6 +639,73 @@ agentscope deploy knative app_agent.py \
 
 # Custom namespace and resources
 agentscope deploy knative app_agent.py \
+  --namespace production \
+  --cpu-limit 2 \
+  --memory-limit 4Gi \
+  --env DASHSCOPE_API_KEY=sk-xxx
+```
+
+**Note:** `USE_LOCAL_RUNTIME=True` uses local agentscope runtime instead of PyPI version.
+
+#### 4.5. Kruise Deployment
+
+Deploy to Kruise Sandbox custom resource (`agents.kruise.io/v1alpha1`) on a Kubernetes cluster.
+
+Key differences from standard K8s Deployment and Knative:
+- **Instance-level isolation**: Ensures secure environment isolation across different agents
+- **Pause/Resume**: Supports pausing and resuming, effectively saving resource consumption
+- **Auto-created LoadBalancer Service**: Automatically creates load balancer service for external access
+
+##### Command Syntax
+
+```bash
+agentscope deploy kruise SOURCE [OPTIONS]
+```
+
+##### Platform-Specific Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--namespace` | string | `"agentscope-runtime"` | Kubernetes namespace |
+| `--kube-config-path` | path | `None` | Path to kubeconfig file |
+| `--port` | integer | `8080` | Container port |
+| `--image-name` | string | `"agent_app"` | Docker image name |
+| `--image-tag` | string | `"linux-amd64"` | Docker image tag |
+| `--registry-url` | string | `"localhost"` | Remote registry URL |
+| `--registry-namespace` | string | `"agentscope-runtime"` | Remote registry namespace |
+| `--push` | flag | `False` | Push image to registry |
+| `--base-image` | string | `"python:3.10-slim-bookworm"` | Base Docker image |
+| `--requirements` | string | `None` | Python requirements (comma-separated or file path) |
+| `--cpu-request` | string | `"200m"` | CPU resource request (e.g., '200m', '1') |
+| `--cpu-limit` | string | `"1000m"` | CPU resource limit (e.g., '1000m', '2') |
+| `--memory-request` | string | `"512Mi"` | Memory resource request (e.g., '512Mi', '1Gi') |
+| `--memory-limit` | string | `"2Gi"` | Memory resource limit (e.g., '2Gi', '4Gi') |
+| `--image-pull-policy` | choice | `"IfNotPresent"` | Image pull policy: `Always`, `IfNotPresent`, `Never` |
+| `--deploy-timeout` | integer | `300` | Deployment timeout in seconds |
+| `--platform` | string | `"linux/amd64"` | Target platform (e.g., 'linux/amd64', 'linux/arm64') |
+| `--pypi-mirror` | string | `None` | PyPI mirror URL for pip package installation (e.g., 'https://pypi.tuna.tsinghua.edu.cn/simple'). If not specified, uses pip default |
+
+##### Prerequisites
+
+- Kubernetes cluster access
+- Kruise Sandbox CRD (`agents.kruise.io/v1alpha1`) installed, see [Kruise Agents](https://github.com/openkruise/agents)
+- Docker installed (for building images)
+- `kubectl` configured
+
+##### Examples
+
+```bash
+# Basic deployment
+export USE_LOCAL_RUNTIME=True
+agentscope deploy kruise app_agent.py \
+  --image-name agent_app \
+  --env DASHSCOPE_API_KEY=sk-xxx \
+  --image-tag linux-amd64-1 \
+  --registry-url your-registry.com \
+  --push
+
+# Custom namespace and resources
+agentscope deploy kruise app_agent.py \
   --namespace production \
   --cpu-limit 2 \
   --memory-limit 4Gi \
